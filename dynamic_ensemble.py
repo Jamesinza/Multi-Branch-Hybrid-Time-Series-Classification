@@ -9,51 +9,51 @@ from scipy.stats import norm, pearsonr
 import matplotlib.pyplot as plt
 from tensorflow.keras import mixed_precision
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling1D, GlobalMaxPooling1D, Dropout, Add, \
-    LayerNormalization, MultiHeadAttention
+from tensorflow.keras.layers import (Input, Dense, GlobalAveragePooling1D, GlobalMaxPooling1D, 
+                                     Dropout, Add, LayerNormalization, MultiHeadAttention, Conv1D,
+                                     Concatenate)
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from keras_hub.layers import TransformerEncoder, SinePositionEncoding
 from hmmlearn.hmm import GaussianHMM, CategoricalHMM, GMMHMM, PoissonHMM
 
-# Enable mixed precision
+# Enable mixed precision for speed gains
 mixed_precision.set_global_policy('mixed_float16')
 
 ###############################################################################
-# DATASET & FEATURE EXTRACTION FUNCTIONS
+# TIME SERIES DATA AUGMENTATION & PREPROCESSING FUNCTIONS
 ###############################################################################
 
-def create_dataset(sequence, window_length, batch_size, shuffle=False):
-    """Create a cached and prefetch-enabled tf.data.Dataset."""
-    ds = tf.data.Dataset.from_tensor_slices(sequence)
-    ds = ds.window(window_length + 1, shift=1, drop_remainder=True)
-    ds = ds.flat_map(lambda window: window.batch(window_length + 1))
-    # Assume the last column is the target; the remaining columns are features.
-    ds = ds.map(lambda window: (window[:-1, :-1], window[-1, -1]),
-                num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.cache()
-    ds = ds.batch(batch_size)
-    if shuffle:
-        ds = ds.shuffle(1000)
-    ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
-    return ds
+def augment_time_series(series, noise_std=0.01, warp_factor=0.05):
+    """
+    Apply simple time series augmentations:
+      - Add Gaussian noise.
+      - Slightly warp the time axis via linear interpolation.
+    """
+    # Noise injection
+    noisy = series + np.random.normal(0, noise_std, size=series.shape)
+    
+    # Time warping: create a new time axis slightly perturbed
+    orig_idx = np.arange(len(noisy))
+    warp = np.interp(orig_idx, 
+                     orig_idx + np.random.uniform(-warp_factor, warp_factor, size=series.shape),
+                     noisy)
+    return warp.astype(np.float32)
 
 def natural_visibility_graph(window):
     """
     Convert a 1D time series window into a visibility graph.
-    Two nodes i and j (i < j) are connected if every intermediate k
-    satisfies: window[k] < window[i] + (window[j]-window[i])*(k-i)/(j-i)
+    Two nodes i and j are connected if for each intermediate k:
+      window[k] < window[i] + (window[j]-window[i])*(k-i)/(j-i)
     """
     n = len(window)
     G = nx.Graph()
     G.add_nodes_from(range(n))
     for i in range(n):
         for j in range(i+1, n):
-            # Early break if any intermediate point blocks visibility.
             visible = True
             delta = window[j] - window[i]
             for k in range(i+1, j):
-                # Linear interpolation from i to j at k.
                 if window[k] >= window[i] + delta * (k - i) / (j - i):
                     visible = False
                     break
@@ -62,7 +62,11 @@ def natural_visibility_graph(window):
     return G
 
 def compute_visibility_features(window):
-    """Compute average degree and clustering from the natural visibility graph."""
+    """
+    Extract two features from the natural visibility graph:
+      - Average node degree.
+      - Clustering coefficient.
+    """
     window = np.array(window).flatten()
     G = natural_visibility_graph(window)
     if len(G) == 0:
@@ -73,20 +77,19 @@ def compute_visibility_features(window):
 
 def get_extra_features(X_raw, rng):
     """
-    Augment the raw input with HMM-based and NVG-based features.
-    The raw data X_raw is assumed to be a 2D array.
+    Augment the raw input with engineered features based on:
+      - HMMs (Gaussian, Categorical, GMM, Poisson)
+      - Natural Visibility Graph (NVG) features.
     """
-    # Make copies for HMM-based features
+    # Work on copies for different HMMs
     hs1 = X_raw.copy()
     hs2 = X_raw.copy()
     hs3 = X_raw.copy()
     hs4 = X_raw.copy()
     base_features = X_raw.copy()
 
-    # --- HMM Feature Augmentation ---
-    # Loop over a single iteration or more if needed.
-    for i in range(1):  
-        # GaussianHMM and CategoricalHMM
+    # HMM-based augmentation (one iteration sufficient, extendable if needed)
+    for i in range(1):
         hmm_g = GaussianHMM(n_components=10 - i, covariance_type="full", random_state=rng)
         hmm_c = CategoricalHMM(n_components=10 - i, n_features=10, random_state=rng)
         hmm_g.fit(hs1)
@@ -94,84 +97,186 @@ def get_extra_features(X_raw, rng):
         hs1_pred = hmm_g.predict(hs1).reshape(-1, 1).astype(np.float32)
         hs2_pred = hmm_c.predict(hs2).reshape(-1, 1).astype(np.float32)
         base_features = np.hstack([base_features, hs1_pred, hs2_pred])
-        hs1, hs2 = hs1_pred, hs2_pred  # Update for potential further iterations
+        hs1, hs2 = hs1_pred, hs2_pred
 
-    # GMMHMM Feature
+    # GMMHMM feature
     hmm_gmm = GMMHMM(n_components=10, n_mix=1, covariance_type="full", random_state=rng)
     hmm_gmm.fit(hs3)
     hs3_pred = hmm_gmm.predict(hs3).reshape(-1, 1).astype(np.float32)
     base_features = np.hstack([base_features, hs3_pred])
 
-    # PoissonHMM Feature
+    # PoissonHMM feature
     hmm_pois = PoissonHMM(n_components=10, random_state=rng)
     hmm_pois.fit(hs4)
     hs4_pred = hmm_pois.predict(hs4).reshape(-1, 1).astype(np.float32)
     base_features = np.hstack([base_features, hs4_pred])
     
-    # --- NVG Feature Augmentation ---
-    nvg_features = []
-    # Compute NVG features in a sliding window of length 10.
+    # NVG-based features computed in sliding windows
     win_size = 10
+    nvg_features = []
     for i in range(len(X_raw) - win_size):
         feat = compute_visibility_features(X_raw[i:i+win_size])
         nvg_features.append(feat)
     nvg_features = np.array(nvg_features, dtype=np.float32)
     
-    # Trim base_features to align with NVG features
     base_features = base_features[win_size:]
-    # Append NVG features to base features.
     X_augmented = np.hstack([base_features, nvg_features])
     return X_augmented
 
-def get_real_data(num_samples, dataset):
-    """Load and preprocess real data from a CSV."""
+def get_real_data(num_samples):
+    """Load and preprocess real data from CSV."""
     print('\nBuilding dataframe using real data...')
-    df = pd.read_csv(f'datasets/UK/{dataset}_ascend.csv')
-    print(df.head())
-    if dataset == 'Euro' or 'Thunderball':
-        cols = ['A', 'B', 'C', 'D', 'E']
-    else:
-        cols = ['A', 'B', 'C', 'D', 'E', 'F']
+    dataset = 'Take5'
+    df = pd.read_csv(f'datasets/{dataset}_Full.csv')
+    cols = ['A', 'B', 'C', 'D', 'E']
     df = df[cols].dropna().astype(np.int8)
-    # Format each element as 2-digit string and then flatten digits into an array.
     df = df.map(lambda x: f'{x:02d}')
     flattened = df.values.flatten()
     full_data = np.array([int(d) for num in flattened for d in str(num)], dtype=np.int8)
     return full_data[:num_samples]
 
 ###############################################################################
-# ENSEMBLE & METRICS FUNCTIONS
+# DATASET PIPELINE: DUAL BRANCH (ENGINEERED + RAW)
 ###############################################################################
 
-def ensemble_predict_weighted(models, weights, X):
+def create_dual_dataset(raw_series, engineered, window_length, batch_size, shuffle=False):
     """
-    Compute weighted predictions from an ensemble.
-    The predictions are summed after weighting each model's softmax output.
+    Create a tf.data.Dataset that yields batches of:
+       ({'eng_input': engineered_window, 'raw_input': raw_window}, target)
+    where:
+      - engineered: output of get_extra_features (2D array)
+      - raw_series: original series (2D array with one feature)
+    The target is taken as the next time step (classification target).
     """
-    preds = [w * model.predict(X, verbose=0) for model, w in zip(models, weights)]
+    # Ensure alignment: engineered series is shorter (due to sliding window in NVG).
+    n_samples = engineered.shape[0] - window_length
+    eng_windows = []
+    raw_windows = []
+    targets = []
+    for i in range(n_samples):
+        eng_windows.append(engineered[i:i+window_length])
+        raw_windows.append(raw_series[i:i+window_length])
+        # Target: use the time step immediately after the window (from raw series)
+        targets.append(raw_series[i+window_length, 0])
+    eng_windows = np.array(eng_windows, dtype=np.float32)
+    raw_windows = np.array(raw_windows, dtype=np.float32)
+    targets = np.array(targets, dtype=np.int32)
+    
+    ds = tf.data.Dataset.from_tensor_slices(({'eng_input': eng_windows, 
+                                               'raw_input': raw_windows}, targets))
+    if shuffle:
+        ds = ds.shuffle(1000)
+    ds = ds.batch(batch_size).cache().repeat().prefetch(tf.data.AUTOTUNE)
+    return ds
+
+###############################################################################
+# CUSTOM TIME2VEC LAYER FOR RELATIVE POSITIONAL ENCODING
+###############################################################################
+
+class Time2Vec(tf.keras.layers.Layer):
+    """
+    Time2Vec layer: Represents each time step as a linear component and periodic features.
+    See “Time2Vec: Learning a Vector Representation of Time” for further details.
+    """
+    def __init__(self, kernel_size=1, **kwargs):
+        super(Time2Vec, self).__init__(**kwargs)
+        self.kernel_size = kernel_size
+
+    def build(self, input_shape):
+        # Bias and weight for the linear part.
+        self.w0 = self.add_weight(name="w0", shape=(1,), initializer="uniform", trainable=True)
+        self.b0 = self.add_weight(name="b0", shape=(1,), initializer="uniform", trainable=True)
+        # Weights and bias for periodic features.
+        self.w = self.add_weight(name="w", shape=(int(input_shape[-1]), self.kernel_size), initializer="uniform", trainable=True)
+        self.b = self.add_weight(name="b", shape=(self.kernel_size,), initializer="uniform", trainable=True)
+        super(Time2Vec, self).build(input_shape)
+
+    def call(self, inputs):
+        # Linear term
+        linear = self.w0 * inputs + self.b0
+        # Periodic term
+        periodic = tf.math.sin(tf.tensordot(inputs, self.w, axes=1) + self.b)
+        return tf.concat([linear, periodic], axis=-1)
+
+###############################################################################
+# HYBRID MODEL ARCHITECTURE: DUAL-BRANCH (ENGINEERED + RAW)
+###############################################################################
+
+def create_dual_branch_model(seed, window_length, eng_feature_dim, num_classes=10):
+    """
+    Create a dual-branch model that processes:
+      1. Engineered features using Transformer-inspired blocks with Time2Vec positional encoding.
+      2. Raw time series using 1D CNN layers.
+    Their outputs are concatenated for final classification.
+    """
+    tf.keras.backend.clear_session()
+    tf.random.set_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    # Engineered branch input
+    eng_input = Input(shape=(window_length, eng_feature_dim), name='eng_input')
+    # Project input and add Time2Vec encoding (relative positional)
+    proj_eng = Dense(128)(eng_input)
+    pos_enc = Time2Vec(kernel_size=32)(proj_eng)
+    x_eng = Add()([proj_eng, pos_enc])
+    # Transformer-inspired block(s)
+    num_heads = 4
+    key_dim = 128 // num_heads
+    for _ in range(2):
+        attn = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(x_eng, x_eng)
+        attn = Dropout(0.2)(attn)
+        x_eng = LayerNormalization()(Add()([x_eng, attn]))
+        ffn = Dense(512, activation='gelu')(x_eng)
+        ffn = Dense(128, activation='gelu')(ffn)
+        ffn = Dropout(0.2)(ffn)
+        x_eng = LayerNormalization()(Add()([x_eng, ffn]))
+    eng_out = GlobalAveragePooling1D()(x_eng)
+    
+    # Raw branch input
+    raw_input = Input(shape=(window_length, 1), name='raw_input')
+    # 1D CNN block to extract local patterns
+    x_raw = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(raw_input)
+    x_raw = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(x_raw)
+    x_raw = GlobalAveragePooling1D()(x_raw)
+    
+    # Concatenate both branches
+    concat = Concatenate()([eng_out, x_raw])
+    dense = Dense(128, activation='gelu')(concat)
+    dense = Dropout(0.3)(dense)
+    outputs = Dense(num_classes, activation='softmax', dtype='float32')(dense)
+    
+    model = Model(inputs=[eng_input, raw_input], outputs=outputs)
+    
+    # Use AdamW with a cosine decay schedule (cyclical learning rate style)
+    lr_schedule = tf.keras.experimental.CosineDecayRestarts(initial_learning_rate=1e-3, first_decay_steps=1000)
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_schedule)
+    
+    model.compile(optimizer=optimizer,
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'],
+                  jit_compile=True)
+    
+    print(f"Created dual-branch model with seed {seed}")
+    return model
+
+###############################################################################
+# ENSEMBLE & METRICS FUNCTIONS (UNCHANGED)
+###############################################################################
+
+def ensemble_predict_weighted(models, weights, dataset):
+    preds = [w * model.predict(dataset, verbose=0) for model, w in zip(models, weights)]
     return np.sum(np.array(preds), axis=0)
 
-def get_individual_predictions(models, X_test):
-    """Obtain predictions from each model (as class indices) for test data."""
-    return [np.argmax(model.predict(X_test, verbose=0), axis=1) for model in models]
+def get_individual_predictions(models, dataset):
+    return [np.argmax(model.predict(dataset, verbose=0), axis=1) for model in models]
 
 def compute_error_correlations(preds, y_true):
-    """
-    Compute pairwise Pearson correlations between binary error vectors.
-    Uses vectorized operations with safe correction when standard deviation is zero.
-    """
     errors = np.array([(pred != y_true).astype(np.float32) for pred in preds])
-    # Compute correlation matrix using np.corrcoef along the appropriate axis.
     corr = np.corrcoef(errors)
-    # Replace nan values (from constant vectors) with zeros.
-    corr = np.nan_to_num(corr)
-    return corr
+    return np.nan_to_num(corr)
 
 def compute_q_statistic_matrix(preds, y_true):
-    """
-    Compute the pairwise Q-statistic matrix.
-    Q = (N11 * N00 - N10 * N01) / (N11 * N00 + N10 * N01)
-    """
     n_models = len(preds)
     correctness = [pred == y_true for pred in preds]
     q_matrix = np.zeros((n_models, n_models))
@@ -182,14 +287,10 @@ def compute_q_statistic_matrix(preds, y_true):
             N10 = np.sum(np.logical_and(correctness[i], ~correctness[j]))
             N01 = np.sum(np.logical_and(~correctness[i], correctness[j]))
             denom = (N11 * N00 + N10 * N01)
-            q_matrix[i, j] = (N11 * N00 - N10 * N01) / denom if denom != 0 else 0.0
+            q_matrix[i, j] = (N11 * N00 - N10 * N01)/denom if denom != 0 else 0.0
     return q_matrix
 
 def compute_double_fault_matrix(preds, y_true):
-    """
-    Compute the pairwise double-fault measure matrix.
-    DF = N00 / (N00 + N10 + N01)
-    """
     n_models = len(preds)
     correctness = [pred == y_true for pred in preds]
     df_matrix = np.zeros((n_models, n_models))
@@ -203,10 +304,6 @@ def compute_double_fault_matrix(preds, y_true):
     return df_matrix
 
 def select_diverse_models(q_matrix, val_accuracies, threshold=0.3):
-    """
-    Greedily select models with pairwise Q-statistic below threshold.
-    The models are sorted by decreasing validation accuracy.
-    """
     sorted_indices = np.argsort(val_accuracies)[::-1]
     selected = []
     for idx in sorted_indices:
@@ -215,233 +312,143 @@ def select_diverse_models(q_matrix, val_accuracies, threshold=0.3):
     return selected
 
 def recalc_q_matrix(selected_indices, full_q_matrix):
-    """Extract submatrix corresponding to the selected model indices."""
     return full_q_matrix[np.ix_(selected_indices, selected_indices)]
 
 ###############################################################################
-# MODEL ARCHITECTURE & TRAINING FUNCTIONS
+# MAIN ENSEMBLE TRAINING & EVALUATION LOOP
 ###############################################################################
 
-def create_random_model(seed, data, val_ds, X_test, y_test, scaler, window_length, batch_size):
-    """
-    Create a diverse Transformer-inspired model with random hyperparameters,
-    and prepare training, validation, and test datasets.
-    """
-    print(f'Input data shape: {data.shape}')
-    # Reshape raw data and separate target
-    X_raw = data.reshape(-1, 1)
-    y_data = data[10:].reshape(-1, 1)
-    # Enhance features using HMM and NVG based approaches
-    X_augmented = get_extra_features(X_raw, rng=42)
-    
-    features = X_augmented.shape[1]
-    input_shape = (window_length, features)
-    
-    # Scale only the extra features (keep target unscaled)
-    X_scaled = scaler.fit_transform(X_augmented)
-    # Append unscaled target as final column
-    X_full = np.hstack([X_scaled, y_data[10 - 10:]])  # Align target with augmented features
+# Hyperparameters
+batch_size = 1024
+epochs = 100
+window_length = 10
+num_samples = 110_000
+sub_samples = 90_000
+n_models = 10
 
-    # Split dataset indices: use the initial part for training and last part for validation/test.
-    split = 1_000
-    train_data = X_full[:-split]
-    if val_ds is None:
-        val_data = X_full[-split:-split//2]
-        X_test_arr = X_full[-split//2:]
-        # Build test arrays from the windows
-        X_test_new = np.empty([len(X_test_arr)-window_length, window_length, features], dtype=np.float32)
-        y_test_new = np.empty([len(X_test_arr)-window_length, 1], dtype=np.int8)
-        for i in range(len(X_test_arr)-window_length):
-            X_test_new[i] = X_test_arr[i:i+window_length, :-1]
-            y_test_new[i] = X_test_arr[i+window_length, -1]
-        X_test, y_test = X_test_new, y_test_new
+# Data & Scaling Setup
+scaler = StandardScaler()
+data = get_real_data(num_samples)
+print(f'\nData shape: {data.shape}')
+val_test_data = data[-10_000:]
 
-        val_ds = create_dataset(val_data, window_length, batch_size)
+# Augment and prepare dual inputs
+# (Augmentation can be applied on the raw series for extra diversity)
+augmented_raw = augment_time_series(data)
+raw_series = augmented_raw.reshape(-1, 1).astype(np.float32)
+# Engineered features via HMM+NVG (note: get_extra_features expects 2D input)
+engineered_features = get_extra_features(raw_series, rng=42)
+# For the raw branch, we trim the series to match engineered_features length.
+raw_aligned = raw_series[len(raw_series) - engineered_features.shape[0]:]
+
+# Create dataset splits for training/validation/test.
+split = 10_000
+train_eng = engineered_features[:-split]
+train_raw = raw_aligned[:-split]
+val_eng = engineered_features[-split:-split//2]
+val_raw = raw_aligned[-split:-split//2]
+test_eng = engineered_features[-split//2:]
+test_raw = raw_aligned[-split//2:]
+
+# Scale engineered features only (raw input is kept as is)
+train_eng = scaler.fit_transform(train_eng)
+val_eng = scaler.transform(val_eng)
+test_eng = scaler.transform(test_eng)
+
+# Build tf.data Datasets.
+train_ds = create_dual_dataset(train_raw, train_eng, window_length, batch_size, shuffle=True)
+val_ds   = create_dual_dataset(val_raw, val_eng, window_length, batch_size)
+test_ds  = create_dual_dataset(test_raw, test_eng, window_length, batch_size)
+
+# Prepare ensemble containers and training seeds.
+ensemble_models = []
+val_accuracies = []
+seeds = [random.randint(0, num_samples - sub_samples - split) for _ in range(n_models)]
+
+# For class imbalance, we assume targets are digits (0-9) derived from raw series.
+# We extract targets from the validation dataset for later weighting.
+# (Here we take the first batch as representative.)
+sample_batch = next(iter(val_ds))
+_, y_sample = sample_batch
+unique_classes = np.unique(y_sample)
+# Assume y_train here from train_ds (for brevity we use y_sample)
+class_weights = compute_class_weight('balanced', classes=unique_classes, y=y_sample.numpy().flatten())
+class_weights_dict = dict(enumerate(class_weights))
+
+for i, seed in enumerate(seeds):
+    tf.keras.backend.clear_session()
+    gc.collect()
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    random.seed(seed)
     
-    train_ds = create_dataset(train_data, window_length, batch_size, shuffle=True)
+    model = create_dual_branch_model(seed, window_length, eng_feature_dim=train_eng.shape[1])
     
-    # Derive class weights from training target to address imbalance.
-    y_train = y_data[:len(X_augmented)][:, 0]
-    unique_classes = np.unique(y_train)
-    class_weights = compute_class_weight('balanced', classes=unique_classes, y=y_train)
-    class_weights_dict = dict(enumerate(class_weights))
+    print(f"\nTraining model {i+1}/{n_models}")
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=5, cooldown=5)
+    ]
     
-    # Calculate steps per epoch
-    train_steps = math.ceil(len(train_data) / batch_size)
+    steps_per_epoch = math.ceil(len(train_eng) / batch_size)
     val_steps = math.ceil((split//2) / batch_size)
     
-    # Random hyperparameters
-    chosen_units      = random.choice([128])
-    chosen_layers     = random.choice([2])
-    chosen_activation = random.choice(['gelu'])
-    chosen_dropout    = random.choice([0.3])
-    chosen_optimizer  = random.choice(['adamw'])
-    chosen_flat       = random.choice(['gap'])
+    model.fit(train_ds,
+              steps_per_epoch=steps_per_epoch,
+              validation_data=val_ds,
+              validation_steps=val_steps,
+              epochs=epochs,
+              callbacks=callbacks,
+              class_weight=class_weights_dict,
+              verbose=1)
     
-    # Transformer-inspired architecture hyperparameters
-    hid_dim = chosen_units
-    num_heads = 2
-    int_dim = hid_dim * 4
-    key_dim = hid_dim // num_heads
+    loss, accuracy = model.evaluate(val_ds, steps=val_steps, verbose=0)
+    print(f"Validation accuracy for model {i+1}: {accuracy:.4f}")
+    ensemble_models.append(model)
+    val_accuracies.append(accuracy)
 
-    # Build model architecture using Keras Functional API.
-    inputs = Input(shape=input_shape)
-    proj = Dense(hid_dim)(inputs)
-    pos_enc = SinePositionEncoding()(proj)
-    x = Add()([proj, pos_enc])
-    
-    for _ in range(chosen_layers):
-        mha = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(x, x)
-        if chosen_dropout > 0:
-            mha = Dropout(chosen_dropout)(mha)
-        x = Add()([x, mha])
-        x = LayerNormalization()(x)
-        ffn = Dense(int_dim, activation=chosen_activation)(x)
-        ffn = Dense(hid_dim, activation=chosen_activation)(ffn)
-        if chosen_dropout > 0:
-            ffn = Dropout(chosen_dropout)(ffn)
-        x = Add()([x, ffn])
-        x = LayerNormalization()(x)
-    
-    # Global pooling (optionally average or max)
-    if chosen_flat == 'gap':
-        x = GlobalAveragePooling1D()(x)
-    else:
-        x = GlobalMaxPooling1D()(x)
-        
-    x = Dense(hid_dim, activation=chosen_activation)(x)
-    if chosen_dropout > 0:
-        x = Dropout(chosen_dropout)(x)
-    outputs = Dense(10, activation='softmax', dtype='float32')(x)
-    model = Model(inputs, outputs)
-    
-    # Select optimizer instance based on hyperparameter choice.
-    if chosen_optimizer == 'adamw':
-        optimizer_instance = tf.keras.optimizers.AdamW(learning_rate=1e-3)
-    else:
-        optimizer_instance = tf.keras.optimizers.Adam(learning_rate=1e-3)
+# Compute dynamic weights for ensemble based on validation accuracy.
+total_acc = sum(val_accuracies)
+weights = [acc / total_acc for acc in val_accuracies]
+print("\nDynamic Model Weights:", weights)
 
-    model.compile(optimizer=optimizer_instance,
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'],
-                  jit_compile=True)
-    
-    print(f"Created model: layers={chosen_layers}, units={chosen_units}, activation={chosen_activation}, "
-          f"dropout={chosen_dropout}, optimizer={chosen_optimizer}, pooling={chosen_flat}, seed={seed}")
-    return model, train_ds, val_ds, X_test, y_test, train_steps, val_steps, class_weights_dict
+# Evaluate full ensemble on test data.
+ensemble_preds = ensemble_predict_weighted(ensemble_models, weights, test_ds)
+# Extract targets from test dataset (assuming first batch for simplicity)
+sample_test_batch = next(iter(test_ds))
+_, y_test = sample_test_batch
+ensemble_accuracy = np.mean(np.argmax(ensemble_preds, axis=1).astype(np.int8) == y_test.numpy().flatten())
+print("\nWeighted Ensemble Accuracy on Test Set:", ensemble_accuracy)
 
-def main():
-    ###############################################################################
-    # MAIN ENSEMBLE TRAINING & EVALUATION LOOP
-    ###############################################################################
+# Compute per-model predictions for error metrics.
+predictions_list = get_individual_predictions(ensemble_models, test_ds)
+q_matrix = compute_q_statistic_matrix(predictions_list, y_test.numpy().flatten())
+print("\nPairwise Q-statistic Matrix:\n", q_matrix)
+df_matrix = compute_double_fault_matrix(predictions_list, y_test.numpy().flatten())
+print("\nPairwise Double-Fault Matrix:\n", df_matrix)
 
-    # Hyperparameters
-    batch_size = 32
-    epochs = 100
-    window_length = 10
-    num_samples = 30_000
-    sub_samples = 28_000
-    test_samples = 1_000
-    n_models = 10
+# --- Diverse Model Selection using Q-statistic ---
+selected_indices = select_diverse_models(q_matrix, val_accuracies, threshold=0.3)
+print("Selected diverse model indices:", selected_indices)
+reduced_q_matrix = recalc_q_matrix(selected_indices, q_matrix)
+print("Reduced Q-statistic Matrix for selected models:\n", reduced_q_matrix)
+selected_models = [ensemble_models[i] for i in selected_indices]
+selected_val_acc = [val_accuracies[i] for i in selected_indices]
+total_selected_acc = sum(selected_val_acc)
+selected_weights = [acc / total_selected_acc for acc in selected_val_acc]
+print("Selected Model Weights:", selected_weights)
+selected_ensemble_preds = ensemble_predict_weighted(selected_models, selected_weights, test_ds)
+selected_ensemble_accuracy = np.mean(np.argmax(selected_ensemble_preds, axis=1).astype(np.int8) == y_test.numpy().flatten())
+print("Selected Ensemble Accuracy on Test Set:", selected_ensemble_accuracy)
 
-    # Data and scaler setup
-    dataset = 'HotPicks'
-    scaler = StandardScaler()
-    data = get_real_data(num_samples, dataset)
-    print(f'\nData shape: {data.shape}')
-    val_test_data = data[-test_samples:]
-
-    # Prepare ensemble containers and random seeds for each model training.
-    ensemble_models = []
-    val_accuracies = []
-    seeds = [random.randint(0, num_samples - sub_samples - test_samples) for _ in range(n_models)]
-
-    # Initialize validation and test datasets once (they remain fixed across models)
-    val_ds, X_test, y_test = None, None, None
-
-    for i, seed in enumerate(seeds):
-        tf.keras.backend.clear_session()
-        gc.collect()
-        np.random.seed(seed)
-        tf.random.set_seed(seed)
-        random.seed(seed)
-
-        # Combine a training subset with the fixed validation/test segment.
-        train_data = data[seed:seed + sub_samples]
-        train_data = np.concatenate([train_data, val_test_data], axis=0)
-
-        model, train_ds, val_ds, X_test, y_test, train_steps, val_steps, class_weights_dict = create_random_model(
-            seed, train_data, val_ds, X_test, y_test, scaler, window_length, batch_size
-        )
-
-        print(f"\nTraining model {i+1}/{n_models}")
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=5, cooldown=5)
-        ]
-
-        model.fit(train_ds,
-                  steps_per_epoch=train_steps,
-                  validation_data=val_ds,
-                  validation_steps=val_steps,
-                  epochs=epochs,
-                  callbacks=callbacks,
-                  class_weight=class_weights_dict,
-                  verbose=1)
-
-        loss, accuracy = model.evaluate(val_ds, steps=val_steps, verbose=0)
-        print(f"Validation accuracy for model {i+1}: {accuracy:.4f}")
-        ensemble_models.append(model)
-        val_accuracies.append(accuracy)
-
-    # Calculate dynamic weights for ensemble based on validation accuracies.
-    total_acc = sum(val_accuracies)
-    weights = [acc / total_acc for acc in val_accuracies]
-    print("\nDynamic Model Weights:", weights)
-
-    # Evaluate the full ensemble on test data.
-    ensemble_preds = ensemble_predict_weighted(ensemble_models, weights, X_test)
-    ensemble_accuracy = np.mean(np.argmax(ensemble_preds, axis=1).astype(np.int8) == y_test.flatten())
-    print("\nWeighted Ensemble Accuracy on Test Set:", ensemble_accuracy)
-
-    # Compute per-model predictions for error-based metrics.
-    predictions_list = get_individual_predictions(ensemble_models, X_test)
-    err_corr = compute_error_correlations(predictions_list, y_test.flatten())
-    print("\nPairwise Error Correlations:\n", err_corr)
-    q_matrix = compute_q_statistic_matrix(predictions_list, y_test.flatten())
-    print("\nPairwise Q-statistic Matrix:\n", q_matrix)
-    df_matrix = compute_double_fault_matrix(predictions_list, y_test.flatten())
-    print("\nPairwise Double-Fault Matrix:\n", df_matrix)
-
-    # --- Model Selection: Diverse Models using Q-statistic ---
-    selected_indices = select_diverse_models(q_matrix, val_accuracies, threshold=0.3)
-    print("Selected diverse model indices:", selected_indices)
-    reduced_q_matrix = recalc_q_matrix(selected_indices, q_matrix)
-    print("Reduced Q-statistic Matrix for selected models:\n", reduced_q_matrix)
-
-    selected_models = [ensemble_models[i] for i in selected_indices]
-    selected_val_acc = [val_accuracies[i] for i in selected_indices]
-    total_selected_acc = sum(selected_val_acc)
-    selected_weights = [acc / total_selected_acc for acc in selected_val_acc]
-    print("Selected Model Weights:", selected_weights)
-
-    selected_ensemble_preds = ensemble_predict_weighted(selected_models, selected_weights, X_test)
-    selected_ensemble_accuracy = np.mean(np.argmax(selected_ensemble_preds, axis=1).astype(np.int8) == y_test.flatten())
-    print("Selected Ensemble Accuracy on Test Set:", selected_ensemble_accuracy)
-
-    # --- Alternative Selection: Models with Weight Above Uniform Average ---
-    alt_selected_indices = [i for i, w in enumerate(weights) if w >= 1 / n_models]
-    print("\nSelected indices based on weight threshold:", alt_selected_indices)
-
-    alt_selected_models = [ensemble_models[i] for i in alt_selected_indices]
-    alt_selected_val_acc = [val_accuracies[i] for i in alt_selected_indices]
-    total_alt_acc = sum(alt_selected_val_acc)
-    alt_selected_weights = [acc / total_alt_acc for acc in alt_selected_val_acc]
-    print("Alternative Selected Model Weights:", alt_selected_weights)
-
-    alt_ensemble_preds = ensemble_predict_weighted(alt_selected_models, alt_selected_weights, X_test)
-    alt_ensemble_accuracy = np.mean(np.argmax(alt_ensemble_preds, axis=1).astype(np.int8) == y_test.flatten())
-    print("Alternative Ensemble Accuracy on Test Set:", alt_ensemble_accuracy)
-
-if __name__ == '__main__':
-    main()
+# --- Alternative Ensemble Selection: Models above Uniform Weight ---
+alt_selected_indices = [i for i, w in enumerate(weights) if w >= 1 / n_models]
+print("\nSelected indices based on weight threshold:", alt_selected_indices)
+alt_selected_models = [ensemble_models[i] for i in alt_selected_indices]
+alt_selected_val_acc = [val_accuracies[i] for i in alt_selected_indices]
+total_alt_acc = sum(alt_selected_val_acc)
+alt_selected_weights = [acc / total_alt_acc for acc in alt_selected_val_acc]
+print("Alternative Selected Model Weights:", alt_selected_weights)
+alt_ensemble_preds = ensemble_predict_weighted(alt_selected_models, alt_selected_weights, test_ds)
+alt_ensemble_accuracy = np.mean(np.argmax(alt_ensemble_preds, axis=1).astype(np.int8) == y_test.numpy().flatten())
+print("Alternative Ensemble Accuracy on Test Set:", alt_ensemble_accuracy)
